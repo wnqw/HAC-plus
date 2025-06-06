@@ -2,18 +2,65 @@ import torch
 import numpy as np
 
 import arithmetic
+from utils.encodings import use_clamp
 
 chunk_size_cuda = 10000
 
 class STE_multistep(torch.autograd.Function):
+    """Straight-through estimator with optional clamping.
+
+    The CUDA version originally omitted clamping which may lead to
+    excessive dynamic range and poor compression.  Bringing the
+    behaviour in line with :mod:`utils.encodings` helps keeping the
+    encoded values within a reasonable range, improving both
+    compression ratio and reconstruction quality.
+    """
+
     @staticmethod
     def forward(ctx, input, Q, input_mean=None):
+        if use_clamp:
+            if input_mean is None:
+                input_mean = input.mean()
+            input_min = input_mean - 15_000 * Q
+            input_max = input_mean + 15_000 * Q
+            input = torch.clamp(input, min=input_min.detach(), max=input_max.detach())
+
         Q_round = torch.round(input / Q)
         Q_q = Q_round * Q
         return Q_q
+
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None
+        return grad_output, None, None
+
+def estimate_optimal_Q(x, n_bits=8, clamp_std=3.0):
+    """Estimate a quantization step for ``x``.
+
+    The step size is derived from the data standard deviation so that
+    ``clamp_std`` standard deviations cover the representable range of a
+    ``n_bits`` uniform quantizer.  This heuristic provides a good trade
+    off between distortion and rate and is useful when a reasonable ``Q``
+    value is not known in advance.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor whose statistics should be analysed.
+    n_bits : int, optional
+        Number of bits to represent the dynamic range.  Default is 8.
+    clamp_std : float, optional
+        Multiple of standard deviation to cover.  Default is 3.0.
+
+    Returns
+    -------
+    torch.Tensor
+        Suggested quantization step size as a scalar tensor residing on
+        the same device as ``x``.
+    """
+    std = torch.std(x.detach())
+    dynamic_range = 2 * clamp_std * std
+    q = dynamic_range / (2 ** n_bits - 1)
+    return torch.clamp(q, min=1e-9)
 
 def get_binary_vxl_size(binary_vxl):
     # binary_vxl: {0, 1}
