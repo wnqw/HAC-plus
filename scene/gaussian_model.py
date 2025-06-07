@@ -254,6 +254,8 @@ class GaussianModel(nn.Module):
                  use_2D: bool=True,
                  decoded_version: bool=False,
                  is_synthetic_nerf: bool=False,
+                 lightweight_context: bool=False,
+                 direct_anchor_context: bool=False,
                  ):
         super().__init__()
         print('hash_params:', use_2D, n_features_per_level,
@@ -268,6 +270,8 @@ class GaussianModel(nn.Module):
         self.update_init_factor = update_init_factor
         self.update_hierachy_factor = update_hierachy_factor
         self.use_feat_bank = use_feat_bank
+        self.lightweight_context = lightweight_context
+        self.direct_anchor_context = direct_anchor_context
         self.x_bound_min = torch.zeros(size=[1, 3], device='cuda')
         self.x_bound_max = torch.ones(size=[1, 3], device='cuda')
         self.n_features_per_level = n_features_per_level
@@ -366,17 +370,31 @@ class GaussianModel(nn.Module):
             nn.Sigmoid()
         ).cuda()
 
+        grid_input_dim = self.encoding_xyz.output_dim
+        if self.direct_anchor_context:
+            grid_input_dim += feat_dim
         self.mlp_grid = nn.Sequential(
-            nn.Linear(self.encoding_xyz.output_dim, feat_dim*2),
+            nn.Linear(grid_input_dim, feat_dim*2),
             nn.ReLU(True),
             nn.Linear(feat_dim*2, (feat_dim+6+3*self.n_offsets)*2+feat_dim+1+1+1),
         ).cuda()
 
         if not is_synthetic_nerf:
-            self.mlp_deform = Channel_CTX_fea().cuda()
+            if self.lightweight_context:
+                print('using lightweight context model')
+                self.mlp_deform = Channel_CTX_fea_tiny().cuda()
+            else:
+                self.mlp_deform = Channel_CTX_fea().cuda()
         else:
             print('find synthetic nerf, use Channel_CTX_fea_tiny')
             self.mlp_deform = Channel_CTX_fea_tiny().cuda()
+
+        if self.direct_anchor_context:
+            self.mlp_neighbor = nn.Sequential(
+                nn.Linear(feat_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, feat_dim),
+            ).cuda()
 
         self.entropy_gaussian = Entropy_gaussian(Q=1).cuda()
         self.EG_mix_prob_2 = Entropy_gaussian_mix_prob_2(Q=1).cuda()
@@ -409,6 +427,8 @@ class GaussianModel(nn.Module):
         self.encoding_xyz.eval()
         self.mlp_grid.eval()
         self.mlp_deform.eval()
+        if self.direct_anchor_context:
+            self.mlp_neighbor.eval()
 
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
@@ -420,6 +440,8 @@ class GaussianModel(nn.Module):
         self.encoding_xyz.train()
         self.mlp_grid.train()
         self.mlp_deform.train()
+        if self.direct_anchor_context:
+            self.mlp_neighbor.train()
 
         if self.use_feat_bank:
             self.mlp_feature_bank.train()
@@ -522,12 +544,43 @@ class GaussianModel(nn.Module):
         self.x_bound_max = x_bound_max
         print('anchor_bound_updated')
 
+    def calc_anchor_neighbor_feat(self, x, k=4, chunk_size=4096, anchor_chunk=8192):
+        # x: [N, 3] world coordinates
+        with torch.no_grad():
+            all_anchor = self.get_anchor.detach()
+            k = min(k, all_anchor.shape[0])
+            feats = []
+            for start in range(0, x.shape[0], chunk_size):
+                xs = x[start:start + chunk_size]
+                best_dists = None
+                best_idx = None
+                for a_start in range(0, all_anchor.shape[0], anchor_chunk):
+                    anchor_slice = all_anchor[a_start:a_start + anchor_chunk]
+                    dists = torch.cdist(xs, anchor_slice)
+                    slice_dists, slice_idx = torch.topk(dists, k, dim=1, largest=False)
+                    slice_idx += a_start
+                    if best_dists is None:
+                        best_dists = slice_dists
+                        best_idx = slice_idx
+                    else:
+                        comb_dists = torch.cat([best_dists, slice_dists], dim=1)
+                        comb_idx = torch.cat([best_idx, slice_idx], dim=1)
+                        best_dists, new_indices = torch.topk(comb_dists, k, dim=1, largest=False)
+                        best_idx = comb_idx.gather(1, new_indices)
+                feats.append(self._anchor_feat[best_idx].mean(dim=1))
+        return torch.cat(feats, dim=0)
+
     def calc_interp_feat(self, x):
         # x: [N, 3]
         assert len(x.shape) == 2 and x.shape[1] == 3
         assert torch.abs(self.x_bound_min - torch.zeros(size=[1, 3], device='cuda')).mean() > 0
+        x_world = x
         x = (x - self.x_bound_min) / (self.x_bound_max - self.x_bound_min)  # to [0, 1]
-        features = self.encoding_xyz(x)  # [N, 4*12]
+        features = self.encoding_xyz(x)  # [N, enc]
+        if self.direct_anchor_context:
+            neigh = self.calc_anchor_neighbor_feat(x_world)
+            neigh = self.mlp_neighbor(neigh)
+            features = torch.cat([features, neigh], dim=-1)
         return features
 
     @property
@@ -618,6 +671,7 @@ class GaussianModel(nn.Module):
                 {'params': self.encoding_xyz.parameters(), 'lr': training_args.encoding_xyz_lr_init, "name": "encoding_xyz"},
                 {'params': self.mlp_grid.parameters(), 'lr': training_args.mlp_grid_lr_init, "name": "mlp_grid"},
                 {'params': self.mlp_deform.parameters(), 'lr': training_args.mlp_deform_lr_init, "name": "mlp_deform"},
+                *([{'params': self.mlp_neighbor.parameters(), 'lr': training_args.mlp_grid_lr_init, "name": "mlp_neighbor"}] if self.direct_anchor_context else []),
             ]
         else:
             l = [
@@ -636,6 +690,7 @@ class GaussianModel(nn.Module):
                 {'params': self.encoding_xyz.parameters(), 'lr': training_args.encoding_xyz_lr_init, "name": "encoding_xyz"},
                 {'params': self.mlp_grid.parameters(), 'lr': training_args.mlp_grid_lr_init, "name": "mlp_grid"},
                 {'params': self.mlp_deform.parameters(), 'lr': training_args.mlp_deform_lr_init, "name": "mlp_deform"},
+                *([{'params': self.mlp_neighbor.parameters(), 'lr': training_args.mlp_grid_lr_init, "name": "mlp_neighbor"}] if self.direct_anchor_context else []),
             ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -685,6 +740,14 @@ class GaussianModel(nn.Module):
                                                          step_sub=0 if self.ste_binary else 10000,
                                                          )
 
+        if self.direct_anchor_context:
+            self.mlp_neighbor_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_grid_lr_init,
+                                                    lr_final=training_args.mlp_grid_lr_final,
+                                                    lr_delay_mult=training_args.mlp_grid_lr_delay_mult,
+                                                    max_steps=training_args.mlp_grid_lr_max_steps,
+                                                         step_sub=0 if self.ste_binary else 10000,
+                                                         )
+
         self.mlp_deform_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_deform_lr_init,
                                                     lr_final=training_args.mlp_deform_lr_final,
                                                     lr_delay_mult=training_args.mlp_deform_lr_delay_mult,
@@ -722,6 +785,9 @@ class GaussianModel(nn.Module):
                 param_group['lr'] = lr
             if param_group["name"] == "mlp_deform":
                 lr = self.mlp_deform_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == "mlp_neighbor":
+                lr = self.mlp_neighbor_scheduler_args(iteration)
                 param_group['lr'] = lr
 
     def construct_list_of_attributes(self):
@@ -1076,6 +1142,7 @@ class GaussianModel(nn.Module):
                 'encoding_xyz': self.encoding_xyz.state_dict(),
                 'grid_mlp': self.mlp_grid.state_dict(),
                 'deform_mlp': self.mlp_deform.state_dict(),
+                **({'neighbor_mlp': self.mlp_neighbor.state_dict()} if self.direct_anchor_context else {}),
             }, path)
         else:
             torch.save({
@@ -1085,6 +1152,7 @@ class GaussianModel(nn.Module):
                 'encoding_xyz': self.encoding_xyz.state_dict(),
                 'grid_mlp': self.mlp_grid.state_dict(),
                 'deform_mlp': self.mlp_deform.state_dict(),
+                **({'neighbor_mlp': self.mlp_neighbor.state_dict()} if self.direct_anchor_context else {}),
             }, path)
 
 
@@ -1098,6 +1166,8 @@ class GaussianModel(nn.Module):
         self.encoding_xyz.load_state_dict(checkpoint['encoding_xyz'])
         self.mlp_grid.load_state_dict(checkpoint['grid_mlp'])
         self.mlp_deform.load_state_dict(checkpoint['deform_mlp'])
+        if self.direct_anchor_context and 'neighbor_mlp' in checkpoint:
+            self.mlp_neighbor.load_state_dict(checkpoint['neighbor_mlp'])
 
     def contract_to_unisphere(self,
         x: torch.Tensor,
