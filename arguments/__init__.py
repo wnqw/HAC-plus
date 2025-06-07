@@ -55,6 +55,8 @@ class ModelParams(ParamGroup):
         self.update_hierachy_factor = 4
 
         self.use_feat_bank = False
+        self.lightweight_context = False
+        self.direct_anchor_context = False
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
