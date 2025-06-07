@@ -544,17 +544,30 @@ class GaussianModel(nn.Module):
         self.x_bound_max = x_bound_max
         print('anchor_bound_updated')
 
-    def calc_anchor_neighbor_feat(self, x, k=4, chunk_size=4096):
+    def calc_anchor_neighbor_feat(self, x, k=4, chunk_size=4096, anchor_chunk=8192):
         # x: [N, 3] world coordinates
         with torch.no_grad():
-            all_anchor = self.get_anchor
+            all_anchor = self.get_anchor.detach()
             k = min(k, all_anchor.shape[0])
             feats = []
             for start in range(0, x.shape[0], chunk_size):
                 xs = x[start:start + chunk_size]
-                dists = torch.cdist(xs, all_anchor)
-                idx = torch.topk(dists, k, dim=1, largest=False).indices
-                feats.append(self._anchor_feat[idx].mean(dim=1))
+                best_dists = None
+                best_idx = None
+                for a_start in range(0, all_anchor.shape[0], anchor_chunk):
+                    anchor_slice = all_anchor[a_start:a_start + anchor_chunk]
+                    dists = torch.cdist(xs, anchor_slice)
+                    slice_dists, slice_idx = torch.topk(dists, k, dim=1, largest=False)
+                    slice_idx += a_start
+                    if best_dists is None:
+                        best_dists = slice_dists
+                        best_idx = slice_idx
+                    else:
+                        comb_dists = torch.cat([best_dists, slice_dists], dim=1)
+                        comb_idx = torch.cat([best_idx, slice_idx], dim=1)
+                        best_dists, new_indices = torch.topk(comb_dists, k, dim=1, largest=False)
+                        best_idx = comb_idx.gather(1, new_indices)
+                feats.append(self._anchor_feat[best_idx].mean(dim=1))
         return torch.cat(feats, dim=0)
 
     def calc_interp_feat(self, x):
