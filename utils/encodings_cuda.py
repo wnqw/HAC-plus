@@ -1,7 +1,8 @@
 import torch
 import numpy as np
 
-import arithmetic
+# Use table-based Asymmetric Numeral Systems instead of arithmetic coding
+from utils import tans as arithmetic
 from utils.encodings import use_clamp
 
 chunk_size_cuda = 10000
