@@ -298,6 +298,7 @@ class GaussianModel(nn.Module):
         self.offset_denom = torch.empty(0)
 
         self.anchor_demon = torch.empty(0)
+        self.anchor_clusters = torch.empty(0)
 
         self.optimizer = None
         self.percent_dense = 0
@@ -530,6 +531,15 @@ class GaussianModel(nn.Module):
         features = self.encoding_xyz(x)  # [N, 4*12]
         return features
 
+    def dynamic_anchor_clustering(self, num_clusters, k=8):
+        """Cluster anchors using a GNN for adaptive grouping."""
+        from utils.gnn_clustering import cluster_anchors
+        anchors = self.get_anchor.detach()
+        feats = self._anchor_feat.detach()
+        cluster_ids = cluster_anchors(anchors, feats, num_clusters, k)
+        self.anchor_clusters = cluster_ids
+        return cluster_ids
+
     @property
     def set_anchor(self, new_anchor):
         assert self._anchor.shape == new_anchor.shape
@@ -590,6 +600,9 @@ class GaussianModel(nn.Module):
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
+        # initialize dynamic anchor clusters
+        self.dynamic_anchor_clustering(num_clusters=8)
+
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -599,6 +612,9 @@ class GaussianModel(nn.Module):
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+
+        # refresh clusters at the start of training
+        self.dynamic_anchor_clustering(num_clusters=8)
 
         if self.use_feat_bank:
             l = [
