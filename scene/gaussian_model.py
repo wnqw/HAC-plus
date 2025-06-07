@@ -544,15 +544,18 @@ class GaussianModel(nn.Module):
         self.x_bound_max = x_bound_max
         print('anchor_bound_updated')
 
-    def calc_anchor_neighbor_feat(self, x, k=4):
-        # x: [N,3] world coordinates
+    def calc_anchor_neighbor_feat(self, x, k=4, chunk_size=4096):
+        # x: [N, 3] world coordinates
         with torch.no_grad():
             all_anchor = self.get_anchor
-            dists = torch.cdist(x, all_anchor)
             k = min(k, all_anchor.shape[0])
-            idx = torch.topk(dists, k, dim=1, largest=False).indices
-        neighbor_feat = self._anchor_feat[idx].mean(dim=1)
-        return neighbor_feat
+            feats = []
+            for start in range(0, x.shape[0], chunk_size):
+                xs = x[start:start + chunk_size]
+                dists = torch.cdist(xs, all_anchor)
+                idx = torch.topk(dists, k, dim=1, largest=False).indices
+                feats.append(self._anchor_feat[idx].mean(dim=1))
+        return torch.cat(feats, dim=0)
 
     def calc_interp_feat(self, x):
         # x: [N, 3]
