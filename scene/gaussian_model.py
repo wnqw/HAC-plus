@@ -534,10 +534,10 @@ class GaussianModel(nn.Module):
     def dynamic_anchor_clustering(self, num_clusters, k=8):
         """Cluster anchors using a GNN for adaptive grouping."""
         from utils.gnn_clustering import cluster_anchors
-        anchors = self.get_anchor.detach()
-        feats = self._anchor_feat.detach()
+        anchors = self.get_anchor.detach().cpu()
+        feats = self._anchor_feat.detach().cpu()
         cluster_ids = cluster_anchors(anchors, feats, num_clusters, k)
-        self.anchor_clusters = cluster_ids
+        self.anchor_clusters = cluster_ids.to(self._anchor.device)
         return cluster_ids
 
     @property

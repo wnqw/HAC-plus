@@ -3,16 +3,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def build_knn_graph(x, k=8):
-    """Build k-NN graph.
+def build_knn_graph(x, k=8, chunk_size=1024):
+    """Build k-NN graph using chunked distance computation to reduce memory.
+
     Args:
         x (Tensor): [N, 3] anchor positions.
+        k (int): number of neighbours.
+        chunk_size (int): number of points to process per chunk.
+
     Returns:
         edge_index (LongTensor): [2, E] edge index.
     """
     N = x.shape[0]
-    dist = torch.cdist(x, x)
-    knn = dist.topk(k + 1, largest=False).indices[:, 1:]
+
+    if N <= chunk_size:
+        dist = torch.cdist(x, x)
+        knn = dist.topk(k + 1, largest=False).indices[:, 1:]
+    else:
+        knn = torch.empty((N, k), dtype=torch.long, device=x.device)
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            dist = torch.cdist(x[start:end], x)
+            knn[start:end] = dist.topk(k + 1, largest=False).indices[:, 1:]
+            del dist
+            if x.device.type == "cuda":
+                torch.cuda.empty_cache()
+
     row = torch.arange(N, device=x.device).unsqueeze(1).repeat(1, k).flatten()
     col = knn.flatten()
     edge_index = torch.stack([row, col], dim=0)
