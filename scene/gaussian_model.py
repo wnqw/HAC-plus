@@ -37,6 +37,8 @@ from utils.encodings_cuda import \
     encoder_gaussian_chunk, decoder_gaussian_chunk, encoder_gaussian_mixed_chunk, decoder_gaussian_mixed_chunk
 from utils.gpcc_utils import compress_gpcc, decompress_gpcc, calculate_morton_order
 
+from torch.nn import functional as F
+
 bit2MB_scale = 8 * 1024 * 1024
 MAX_batch_size = 3000
 
@@ -218,6 +220,29 @@ class Channel_CTX_fea_tiny(nn.Module):
             return mean_d4, scale_d4, prob_d4
         return mean_adj, scale_adj, prob_adj
 
+class AnchorRelationEncoder(nn.Module):
+    """Directly models relationships among anchors via pairwise distances."""
+
+    def __init__(self, k: int = 8, out_dim: int = 32):
+        super().__init__()
+        self.k = k
+        self.mlp = nn.Sequential(
+            nn.Linear(3 * k, out_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(out_dim, out_dim),
+        )
+        self.output_dim = out_dim
+
+    def forward(self, anchors: torch.Tensor) -> torch.Tensor:
+        # anchors: [N, 3]
+        with torch.no_grad():
+            dist = torch.cdist(anchors, anchors)
+            knn_idx = dist.topk(k=self.k + 1, largest=False).indices[:, 1:]
+        neighbors = anchors[knn_idx]  # [N, k, 3]
+        rel = neighbors - anchors.unsqueeze(1)
+        rel = rel.reshape(anchors.shape[0], -1)
+        return self.mlp(rel)
+
 class GaussianModel(nn.Module):
 
     def setup_functions(self):
@@ -254,6 +279,7 @@ class GaussianModel(nn.Module):
                  use_2D: bool=True,
                  decoded_version: bool=False,
                  is_synthetic_nerf: bool=False,
+                 use_direct_anchor_rel: bool=False,
                  ):
         super().__init__()
         print('hash_params:', use_2D, n_features_per_level,
@@ -281,6 +307,7 @@ class GaussianModel(nn.Module):
         self.Q = Q
         self.use_2D = use_2D
         self.decoded_version = decoded_version
+        self.use_direct_anchor_rel = use_direct_anchor_rel
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -328,12 +355,19 @@ class GaussianModel(nn.Module):
                 Q=Q,
             ).cuda()
 
+        if self.use_direct_anchor_rel:
+            self.anchor_relation = AnchorRelationEncoder().cuda()
+        else:
+            self.anchor_relation = None
+
         encoding_params_num = 0
-        for n, p in self.encoding_xyz.named_parameters():
-            encoding_params_num += p.numel()
-        encoding_MB = encoding_params_num / 8 / 1024 / 1024
-        if not ste_binary: encoding_MB *= 32
-        print(f'encoding_param_num={encoding_params_num}, size={encoding_MB}MB.')
+        if not self.use_direct_anchor_rel:
+            for n, p in self.encoding_xyz.named_parameters():
+                encoding_params_num += p.numel()
+            encoding_MB = encoding_params_num / 8 / 1024 / 1024
+            if not ste_binary:
+                encoding_MB *= 32
+            print(f'encoding_param_num={encoding_params_num}, size={encoding_MB}MB.')
 
         if self.use_feat_bank:
             self.mlp_feature_bank = nn.Sequential(
@@ -366,8 +400,9 @@ class GaussianModel(nn.Module):
             nn.Sigmoid()
         ).cuda()
 
+        grid_in_dim = self.anchor_relation.output_dim if self.use_direct_anchor_rel else self.encoding_xyz.output_dim
         self.mlp_grid = nn.Sequential(
-            nn.Linear(self.encoding_xyz.output_dim, feat_dim*2),
+            nn.Linear(grid_in_dim, feat_dim*2),
             nn.ReLU(True),
             nn.Linear(feat_dim*2, (feat_dim+6+3*self.n_offsets)*2+feat_dim+1+1+1),
         ).cuda()
@@ -382,6 +417,8 @@ class GaussianModel(nn.Module):
         self.EG_mix_prob_2 = Entropy_gaussian_mix_prob_2(Q=1).cuda()
 
     def get_encoding_params(self):
+        if self.use_direct_anchor_rel:
+            return torch.empty(0, device='cuda')
         params = []
         if self.use_2D:
             params.append(self.encoding_xyz.encoding_xyz.params)
@@ -525,9 +562,11 @@ class GaussianModel(nn.Module):
     def calc_interp_feat(self, x):
         # x: [N, 3]
         assert len(x.shape) == 2 and x.shape[1] == 3
+        if self.use_direct_anchor_rel:
+            return self.anchor_relation(x)
         assert torch.abs(self.x_bound_min - torch.zeros(size=[1, 3], device='cuda')).mean() > 0
         x = (x - self.x_bound_min) / (self.x_bound_max - self.x_bound_min)  # to [0, 1]
-        features = self.encoding_xyz(x)  # [N, 4*12]
+        features = self.encoding_xyz(x)
         return features
 
     @property
