@@ -12,14 +12,13 @@
 import os
 import time
 from functools import reduce
-from sklearn.cluster import KMeans
 
 import numpy as np
 import torch
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import nn
-from torch_scatter import scatter_max
+from torch_scatter import scatter_max, scatter_mean
 
 from utils.general_utils import (build_scaling_rotation, get_expon_lr_func,
                                  inverse_sigmoid, strip_symmetric)
@@ -1010,15 +1009,50 @@ class GaussianModel(nn.Module):
                 self._opacity = optimizable_tensors["opacity"]
 
     @torch.no_grad()
-    def cluster_anchors(self, n_clusters=None):
-        """Cluster anchors using k-means and return labels and centroids."""
-        anchors_np = self._anchor.detach().cpu().numpy()
-        if n_clusters is None:
-            n_clusters = max(1, anchors_np.shape[0] // 10)
-        kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(anchors_np)
-        labels = torch.tensor(kmeans.labels_, device='cuda', dtype=torch.long)
-        centroids = torch.tensor(kmeans.cluster_centers_, device='cuda', dtype=torch.float)
-        return labels, centroids
+    def merge_close_anchors(self, merge_radius=None):
+        """Merge anchors that fall into the same spatial grid cell."""
+        if merge_radius is None:
+            merge_radius = self.voxel_size * 2
+
+        grid = torch.round(self._anchor / merge_radius).to(torch.int64)
+        unique, inverse = torch.unique(grid, return_inverse=True, dim=0)
+        if unique.shape[0] == self._anchor.shape[0]:
+            return
+
+        new_anchor = unique.float() * merge_radius
+        n_new = unique.shape[0]
+
+        feat_idx = inverse.unsqueeze(-1).expand(-1, self.feat_dim)
+        offset_idx = inverse.unsqueeze(-1).unsqueeze(-1).expand(-1, self.n_offsets, 3)
+        mask_idx = inverse.unsqueeze(-1).unsqueeze(-1).expand(-1, self.n_offsets + 1, 1)
+
+        new_feat = scatter_mean(self._anchor_feat, feat_idx, dim=0, dim_size=n_new)
+        new_offset = scatter_mean(self._offset, offset_idx, dim=0, dim_size=n_new)
+        new_mask = scatter_mean(self._mask, mask_idx, dim=0, dim_size=n_new)
+        new_scaling = scatter_mean(self._scaling, inverse, dim=0, dim_size=n_new)
+        new_opacity = scatter_mean(self._opacity, inverse, dim=0, dim_size=n_new)
+        new_rotation = scatter_mean(self._rotation, inverse, dim=0, dim_size=n_new)
+
+        self._anchor = nn.Parameter(new_anchor.requires_grad_(True))
+        self._anchor_feat = nn.Parameter(new_feat.requires_grad_(True))
+        self._offset = nn.Parameter(new_offset.requires_grad_(True))
+        self._mask = nn.Parameter(new_mask.requires_grad_(True))
+        self._scaling = nn.Parameter(new_scaling.requires_grad_(True))
+        self._opacity = nn.Parameter(new_opacity.requires_grad_(True))
+        self._rotation = nn.Parameter(new_rotation.requires_grad_(True))
+
+        self.replace_tensor_to_optimizer(self._anchor, "anchor")
+        self.replace_tensor_to_optimizer(self._anchor_feat, "anchor_feat")
+        self.replace_tensor_to_optimizer(self._offset, "offset")
+        self.replace_tensor_to_optimizer(self._mask, "mask")
+        self.replace_tensor_to_optimizer(self._scaling, "scaling")
+        self.replace_tensor_to_optimizer(self._opacity, "opacity")
+        self.replace_tensor_to_optimizer(self._rotation, "rotation")
+
+        self.opacity_accum = torch.zeros((n_new, 1), device='cuda')
+        self.anchor_demon = torch.zeros((n_new, 1), device='cuda')
+        self.offset_gradient_accum = torch.zeros((n_new * self.n_offsets, 1), device='cuda')
+        self.offset_denom = torch.zeros((n_new * self.n_offsets, 1), device='cuda')
 
     def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
         # # adding anchors
@@ -1074,49 +1108,8 @@ class GaussianModel(nn.Module):
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)
 
-        # Cluster anchors to merge redundant ones
-        labels, centroids = self.cluster_anchors()
-        unique_labels = torch.unique(labels)
-        if len(unique_labels) < self._anchor.shape[0]:
-            n_new = len(unique_labels)
-            new_anchor = centroids
-            new_feat = torch.zeros((n_new, self.feat_dim), device='cuda')
-            new_offset = torch.zeros((n_new, self.n_offsets, 3), device='cuda')
-            new_mask = torch.ones((n_new, self.n_offsets+1, 1), device='cuda')
-            new_scaling = torch.log(torch.ones((n_new, 6), device='cuda'))
-            new_opacity = inverse_sigmoid(0.1 * torch.ones((n_new, 1), device='cuda'))
-            new_rotation = torch.zeros((n_new, 4), device='cuda')
-            new_rotation[:, 0] = 1.0
-
-            for idx, lbl in enumerate(unique_labels):
-                m = labels == lbl
-                new_feat[idx] = self._anchor_feat[m].mean(dim=0)
-                new_offset[idx] = self._offset[m].mean(dim=0)
-                new_mask[idx] = self._mask[m].mean(dim=0)
-                new_scaling[idx] = self._scaling[m].mean(dim=0)
-                new_opacity[idx] = self._opacity[m].mean(dim=0)
-                new_rotation[idx] = self._rotation[m].mean(dim=0)
-
-            self._anchor = nn.Parameter(new_anchor.requires_grad_(True))
-            self._anchor_feat = nn.Parameter(new_feat.requires_grad_(True))
-            self._offset = nn.Parameter(new_offset.requires_grad_(True))
-            self._mask = nn.Parameter(new_mask.requires_grad_(True))
-            self._scaling = nn.Parameter(new_scaling.requires_grad_(True))
-            self._opacity = nn.Parameter(new_opacity.requires_grad_(True))
-            self._rotation = nn.Parameter(new_rotation.requires_grad_(True))
-
-            self.replace_tensor_to_optimizer(self._anchor, "anchor")
-            self.replace_tensor_to_optimizer(self._anchor_feat, "anchor_feat")
-            self.replace_tensor_to_optimizer(self._offset, "offset")
-            self.replace_tensor_to_optimizer(self._mask, "mask")
-            self.replace_tensor_to_optimizer(self._scaling, "scaling")
-            self.replace_tensor_to_optimizer(self._opacity, "opacity")
-            self.replace_tensor_to_optimizer(self._rotation, "rotation")
-
-            self.opacity_accum = torch.zeros((n_new, 1), device='cuda')
-            self.anchor_demon = torch.zeros((n_new, 1), device='cuda')
-            self.offset_gradient_accum = torch.zeros((n_new*self.n_offsets, 1), device='cuda')
-            self.offset_denom = torch.zeros((n_new*self.n_offsets, 1), device='cuda')
+        # merge close anchors using voxel grid
+        self.merge_close_anchors()
 
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
