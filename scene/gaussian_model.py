@@ -220,10 +220,11 @@ class Channel_CTX_fea_tiny(nn.Module):
 
 class Channel_CTX_fea_lightweight(nn.Module):
     """Simplified context model with fewer parameters."""
-    def __init__(self, feat_dim=50, n_offsets=5):
+    def __init__(self, feat_dim: int = 50, num_groups: int = 5):
         super().__init__()
         self.feat_dim = feat_dim
-        self.n_offsets = n_offsets
+        self.num_groups = num_groups
+        self.group_dim = feat_dim // num_groups
         in_dim = feat_dim * 4  # fea_q + [mean, scale, prob]
         hid_dim = feat_dim
         self.net = nn.Sequential(
@@ -232,13 +233,12 @@ class Channel_CTX_fea_lightweight(nn.Module):
             nn.Linear(hid_dim, feat_dim * 3),
         )
 
-    def forward(self, fea_q, mean_scale, to_dec=-1):
+    def forward(self, fea_q, mean_scale, to_dec: int = -1):
         x = torch.cat([fea_q, mean_scale], dim=-1)
         mean_adj, scale_adj, prob_adj = torch.chunk(self.net(x), 3, dim=-1)
         if to_dec == -1:
             return mean_adj, scale_adj, prob_adj
-        step = self.feat_dim // self.n_offsets
-        b, e = step * to_dec, step * (to_dec + 1)
+        b, e = self.group_dim * to_dec, self.group_dim * (to_dec + 1)
         return mean_adj[:, b:e], scale_adj[:, b:e], prob_adj[:, b:e]
 
 class GaussianModel(nn.Module):
@@ -399,7 +399,8 @@ class GaussianModel(nn.Module):
 
         if lightweight_deform:
             print('using lightweight context model')
-            self.mlp_deform = Channel_CTX_fea_lightweight(feat_dim=feat_dim, n_offsets=n_offsets).cuda()
+            # lightweight network shares weights across feature groups
+            self.mlp_deform = Channel_CTX_fea_lightweight(feat_dim=feat_dim).cuda()
         elif not is_synthetic_nerf:
             self.mlp_deform = Channel_CTX_fea().cuda()
         else:
