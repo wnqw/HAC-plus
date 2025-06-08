@@ -94,6 +94,7 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         log2_hashmap_size=args_param.log2,
         log2_hashmap_size_2D=args_param.log2_2D,
         is_synthetic_nerf=is_synthetic_nerf,
+        lightweight_deform=args_param.lightweight_deform,
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path)
     gaussians.update_anchor_bound()
@@ -431,6 +432,7 @@ def render_sets(args_param, dataset : ModelParams, iteration : int, pipeline : P
             log2_hashmap_size_2D=args_param.log2_2D,
             decoded_version=run_codec,
             is_synthetic_nerf=is_synthetic_nerf,
+            lightweight_deform=args_param.lightweight_deform,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()

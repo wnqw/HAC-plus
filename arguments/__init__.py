@@ -63,6 +63,7 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = True
         self.lod = 0
+        self.lightweight_deform = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
