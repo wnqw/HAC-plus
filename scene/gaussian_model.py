@@ -218,6 +218,29 @@ class Channel_CTX_fea_tiny(nn.Module):
             return mean_d4, scale_d4, prob_d4
         return mean_adj, scale_adj, prob_adj
 
+class Channel_CTX_fea_lightweight(nn.Module):
+    """Simplified context model with fewer parameters."""
+    def __init__(self, feat_dim: int = 50, num_groups: int = 5):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.num_groups = num_groups
+        self.group_dim = feat_dim // num_groups
+        in_dim = feat_dim * 4  # fea_q + [mean, scale, prob]
+        hid_dim = feat_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hid_dim),
+            nn.LeakyReLU(inplace=True),
+            nn.Linear(hid_dim, feat_dim * 3),
+        )
+
+    def forward(self, fea_q, mean_scale, to_dec: int = -1):
+        x = torch.cat([fea_q, mean_scale], dim=-1)
+        mean_adj, scale_adj, prob_adj = torch.chunk(self.net(x), 3, dim=-1)
+        if to_dec == -1:
+            return mean_adj, scale_adj, prob_adj
+        b, e = self.group_dim * to_dec, self.group_dim * (to_dec + 1)
+        return mean_adj[:, b:e], scale_adj[:, b:e], prob_adj[:, b:e]
+
 class GaussianModel(nn.Module):
 
     def setup_functions(self):
@@ -254,6 +277,7 @@ class GaussianModel(nn.Module):
                  use_2D: bool=True,
                  decoded_version: bool=False,
                  is_synthetic_nerf: bool=False,
+                 lightweight_deform: bool=False,
                  ):
         super().__init__()
         print('hash_params:', use_2D, n_features_per_level,
@@ -281,6 +305,7 @@ class GaussianModel(nn.Module):
         self.Q = Q
         self.use_2D = use_2D
         self.decoded_version = decoded_version
+        self.lightweight_deform = lightweight_deform
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -372,7 +397,11 @@ class GaussianModel(nn.Module):
             nn.Linear(feat_dim*2, (feat_dim+6+3*self.n_offsets)*2+feat_dim+1+1+1),
         ).cuda()
 
-        if not is_synthetic_nerf:
+        if lightweight_deform:
+            print('using lightweight context model')
+            # lightweight network shares weights across feature groups
+            self.mlp_deform = Channel_CTX_fea_lightweight(feat_dim=feat_dim).cuda()
+        elif not is_synthetic_nerf:
             self.mlp_deform = Channel_CTX_fea().cuda()
         else:
             print('find synthetic nerf, use Channel_CTX_fea_tiny')
