@@ -63,6 +63,9 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = True
         self.lod = 0
+        self.use_direct_anchor_context = False
+        self.k_anchor = 8
+        self.use_lightweight_context = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

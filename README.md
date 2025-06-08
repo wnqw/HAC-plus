@@ -34,6 +34,13 @@ where an adaptive quantization module is proposed to enable high-precision quant
 Moreover, we incorporate an adaptive masking strategy to eliminate invalid Gaussians and anchors.
 Overall, HAC++ achieves a remarkable size reduction of over $100\times$ compared to vanilla 3DGS when averaged on all datasets, while simultaneously improving fidelity.
 
+## New Features
+
+- **Direct Anchor Context**: optionally model relationships among anchors directly without relying solely on the hash grid. Enable with `--use_direct_anchor_context` and control neighbours via `--k_anchor`.
+- **Lightweight Context Model**: a compact context module for faster training when `--use_lightweight_context` is set.
+
+These additions boost compression efficiency and can yield sharper renderings with minimal overhead.
+
 ## Performance
 <p align="left">
 <img src="assets/main_performance.png" width=80% height=80% 
