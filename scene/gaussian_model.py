@@ -254,6 +254,9 @@ class GaussianModel(nn.Module):
                  use_2D: bool=True,
                  decoded_version: bool=False,
                  is_synthetic_nerf: bool=False,
+                 use_direct_anchor_context: bool=False,
+                 k_anchor: int=8,
+                 use_lightweight_context: bool=False,
                  ):
         super().__init__()
         print('hash_params:', use_2D, n_features_per_level,
@@ -281,6 +284,9 @@ class GaussianModel(nn.Module):
         self.Q = Q
         self.use_2D = use_2D
         self.decoded_version = decoded_version
+        self.use_direct_anchor_context = use_direct_anchor_context
+        self.k_anchor = k_anchor
+        self.use_lightweight_context = use_lightweight_context
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -366,16 +372,30 @@ class GaussianModel(nn.Module):
             nn.Sigmoid()
         ).cuda()
 
+        mlp_grid_in = self.encoding_xyz.output_dim
+        if self.use_direct_anchor_context:
+            self.neighbor_encoder = nn.Sequential(
+                nn.Linear(feat_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, feat_dim),
+            ).cuda()
+            mlp_grid_in += feat_dim
+        else:
+            self.neighbor_encoder = None
+
         self.mlp_grid = nn.Sequential(
-            nn.Linear(self.encoding_xyz.output_dim, feat_dim*2),
+            nn.Linear(mlp_grid_in, feat_dim*2),
             nn.ReLU(True),
             nn.Linear(feat_dim*2, (feat_dim+6+3*self.n_offsets)*2+feat_dim+1+1+1),
         ).cuda()
 
-        if not is_synthetic_nerf:
+        if not is_synthetic_nerf and not self.use_lightweight_context:
             self.mlp_deform = Channel_CTX_fea().cuda()
         else:
-            print('find synthetic nerf, use Channel_CTX_fea_tiny')
+            if not is_synthetic_nerf:
+                print('use lightweight context model')
+            else:
+                print('find synthetic nerf, use Channel_CTX_fea_tiny')
             self.mlp_deform = Channel_CTX_fea_tiny().cuda()
 
         self.entropy_gaussian = Entropy_gaussian(Q=1).cuda()
@@ -526,8 +546,16 @@ class GaussianModel(nn.Module):
         # x: [N, 3]
         assert len(x.shape) == 2 and x.shape[1] == 3
         assert torch.abs(self.x_bound_min - torch.zeros(size=[1, 3], device='cuda')).mean() > 0
-        x = (x - self.x_bound_min) / (self.x_bound_max - self.x_bound_min)  # to [0, 1]
-        features = self.encoding_xyz(x)  # [N, 4*12]
+        x_norm = (x - self.x_bound_min) / (self.x_bound_max - self.x_bound_min)  # to [0, 1]
+        features = self.encoding_xyz(x_norm)  # [N, 4*12]
+        if self.use_direct_anchor_context and self._anchor.numel() > 0:
+            with torch.no_grad():
+                dist = torch.cdist(x, self.get_anchor)
+                k = min(self.k_anchor, dist.shape[1])
+                idx = dist.topk(k, largest=False).indices
+            neigh_feat = self._anchor_feat[idx].mean(dim=1)
+            neigh_feat = self.neighbor_encoder(neigh_feat)
+            features = torch.cat([features, neigh_feat], dim=-1)
         return features
 
     @property
